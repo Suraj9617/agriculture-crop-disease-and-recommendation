@@ -31,12 +31,6 @@ This project is an AI-based system for detecting crop diseases in real-time and 
 5. Display results and logs
 
 ## Sample Results
-**Sample Output 1**  
-- Crop: Tomato  
-- Disease: Early Blight  
-- Recommendation: Apply fungicide, maintain proper irrigation  
-
-## Sample Results
 
 <div align="center">
   <strong>Sample Output 1</strong><br>
