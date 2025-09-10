@@ -1,0 +1,295 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+!rm -rf /kaggle/working/*
+import os
+import cv2
+import imagehash
+import pandas as pd
+import seaborn as sns
+import numpy as np
+import matplotlib.pyplot as plt
+%matplotlib inline
+from PIL import Image
+from concurrent.futures import ProcessPoolExecutor
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchinfo import summary
+from torchvision import transforms, models, datasets
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+from sklearn.metrics import recall_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.preprocessing import label_binarize
+corrupted = []
+df_list = []
+
+root_dir = '/kaggle/working/combined_dataset'
+import os
+import shutil
+
+# Path ke direktori dataset Train dan Validation
+train_dir = '/kaggle/input/20k-multi-class-crop-disease-images/Train'
+validation_dir = '/kaggle/input/20k-multi-class-crop-disease-images/Validation'
+
+# Folder tujuan untuk menyimpan semua gambar gabungan
+destination_base_folder = '/kaggle/working/combined_dataset'
+
+# Buat folder tujuan jika belum ada
+os.makedirs(destination_base_folder, exist_ok=True)
+
+# Fungsi untuk membaca gambar dari direktori dan menyalinnya ke folder tujuan dengan struktur yang sama
+def copy_files_with_structure(source_directory, destination_base_folder):
+    for root, dirs, files in os.walk(source_directory):
+        for file in files:
+            if file.endswith(('png', 'jpg', 'jpeg')):  # Filter file gambar
+                source_file_path = os.path.join(root, file)
+                relative_path = os.path.relpath(root, source_directory)
+                destination_folder = os.path.join(destination_base_folder, relative_path)
+                destination_file_path = os.path.join(destination_folder, file)
+                
+                # Buat folder tujuan jika belum ada
+                os.makedirs(destination_folder, exist_ok=True)
+                
+                # Salin file
+                shutil.copy2(source_file_path, destination_file_path)
+                print(f"File {file} berhasil disalin ke {destination_file_path}.")
+
+# Salin gambar dari folder Train dan Validation ke folder tujuan dengan struktur yang sama
+copy_files_with_structure(train_dir, destination_base_folder)
+copy_files_with_structure(validation_dir, destination_base_folder)
+def process_image(image_path, animal):
+    if not os.path.isfile(image_path):
+        return [image_path, True, None, None, None, None, None, animal]
+
+    img = cv2.imread(image_path)
+    if img is None:
+        return [image_path, True, None, None, None, None, None, animal]
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_pil = Image.fromarray(img_rgb)
+    img_hash = imagehash.phash(img_pil)
+    width, height, channels = img.shape
+    image_format = os.path.splitext(image_path)[-1]
+
+    return [image_path, False, img_hash, image_format, width, height, channels, animal]
+def process_animal(animal_dir, animal):
+    image_paths = [os.path.join(animal_dir, image) for image in os.listdir(animal_dir) if os.path.isfile(os.path.join(animal_dir, image))]
+
+    with ProcessPoolExecutor() as executor:
+        results = executor.map(process_image, image_paths, [animal] * len(image_paths))
+
+    valid_results = []
+    for result in results:
+        if result:
+            if result[1]:
+                corrupted.append(result[0])
+            valid_results.append(result)
+    return valid_results
+for animal in os.listdir(root_dir):
+    animal_dir = os.path.join(root_dir, animal)
+    if os.path.isdir(animal_dir):
+        results = process_animal(animal_dir, animal)
+        df_list.extend(results)
+print(f'Total corrupted images: {len(corrupted)}\n'
+      f'Corrupted Images:\n{corrupted}')		
+df = pd.DataFrame(columns=['image_path', 'corrupted', 'image_hash', 'image_format', 'width', 'height', 'channels', 'label'], data = df_list)
+df.head()
+df.describe().loc[['mean', 'std', 'min', 'max']]
+df['image_format'].value_counts().plot(kind='bar', title='Number of images per format')
+plt.xticks(rotation=0)
+class CONFIG:
+    IMAGE_HEIGHT = 224
+    IMAGE_WIDTH = 224
+    CHANNELS = 3
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    N_CLASSES = df['label'].nunique()
+    
+    BATCH_SIZE = 16
+    N_EPOCHS = 50
+    PATIENCE_EPOCHS = 10
+    LR = 0.001
+    L2 = 0.0001
+    DROPOUT = 0.3
+
+    PATIENCE_SCHEDULER = 5
+
+    MIN_VALUE_ACCURACY = 80
+transform = transforms.Compose([
+    transforms.Resize((CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH)),
+    transforms.ToTensor(),
+    transforms.ColorJitter(brightness=0.3, contrast=0.2, saturation=0.2),
+    transforms.RandomResizedCrop(224, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+dataset = datasets.ImageFolder(root=root_dir, transform=transform)
+
+train_size = int(0.7 * len(dataset))
+val_size = int(0.15 * len(dataset))
+test_size = len(dataset) - train_size - val_size
+train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+train_loader = DataLoader(train_dataset, batch_size=CONFIG.BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=CONFIG.BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=CONFIG.BATCH_SIZE, shuffle=False)
+model = models.efficientnet_b2(weights=models.EfficientNet_B2_Weights.DEFAULT)
+model.classifier = nn.Sequential(
+    nn.Dropout(
+        p=CONFIG.DROPOUT, 
+        inplace=True
+        ), 
+    nn.Linear(
+        model.classifier[1].in_features, 
+        CONFIG.N_CLASSES,  
+        bias=True
+        )
+    )
+efficientnet = models.efficientnet_b2(weights=models.EfficientNet_B2_Weights.DEFAULT)
+
+print(f'Default: {efficientnet.classifier}\n\n CustomModel: {model.classifier}')
+summary(model, input_size=(CONFIG.BATCH_SIZE, CONFIG.CHANNELS, CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH))
+class EarlyStopping:
+    def __init__(self, patience=0, verbose=False, min_delta=0, path="checkpoint.pth", min_val_acc=0):
+        self.patience = patience
+        self.verbose = verbose
+        self.min_delta = min_delta
+        self.path = path
+        self.min_val_acc = min_val_acc
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, model, optimizer, scheduler, train_losses, val_losses, train_accuracies, val_accuracies, learning_rate, l2_norm, epochs):
+        if val_accuracies[-1] < self.min_val_acc:
+            if self.verbose:
+                print(f"Validation accuracy {val_accuracies[-1]:.4f} did not reach minimum {self.min_val_acc:.4f}. Not saving.")
+            return
+
+        score = val_accuracies[-1]
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(model, optimizer, scheduler, train_losses, val_losses, train_accuracies, val_accuracies, learning_rate, l2_norm, epochs)
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(model, optimizer, scheduler, train_losses, val_losses, train_accuracies, val_accuracies, learning_rate, l2_norm, epochs)
+            self.counter = 0
+
+    def save_checkpoint(self, model, optimizer, scheduler, train_losses, val_losses, train_accuracies, val_accuracies, learning_rate, l2_norm, epochs):
+        if self.verbose:
+            print(f"Validation accuracy improved. Saving model with val_loss {val_losses[-1]:.6f}...")
+
+        training_state = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "train_accuracies": train_accuracies,
+            "val_accuracies": val_accuracies,
+            "hyperparameters": {
+                "learning_rate": learning_rate,
+                "L2 norm": l2_norm,
+                "batch_size": 32,
+                "epochs": epochs,
+            }
+        }
+        torch.save(training_state, self.path)
+criterion = nn.CrossEntropyLoss()
+
+optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG.LR, weight_decay=CONFIG.L2)
+
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=CONFIG.PATIENCE_SCHEDULER)
+def train_model(model, data_loader, criterion, optimizer, device):
+    model.train()
+    train_loss, train_correct, train_total = 0, 0, 0
+    for inputs, labels in data_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        train_correct += (predicted == labels).sum().item()
+        train_total += labels.size(0)
+
+    avg_loss = train_loss / len(data_loader)
+    train_accuracy = 100 * train_correct / train_total
+
+    return avg_loss, train_accuracy
+def evaluate_model(model, data_loader, criterion, device):
+    model.eval()
+    val_loss, val_correct, val_total = 0, 0, 0
+    with torch.no_grad():
+        for inputs, labels in data_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+            
+            _, predicted = torch.max(outputs.data, 1)
+            val_correct += (predicted == labels).sum().item()
+            val_total += labels.size(0)
+    
+    avg_loss = val_loss / len(data_loader)
+    val_accuracy = 100 * val_correct / val_total
+
+    scheduler.step(val_loss)
+    current_lr = scheduler.get_last_lr()[0]
+    
+    return avg_loss, val_accuracy, current_lr
+train_accuracies = []
+val_accuracies = []
+train_losses = []
+val_losses = []
+
+early_stopping = EarlyStopping(patience=CONFIG.PATIENCE_EPOCHS, verbose=True, min_val_acc=CONFIG.MIN_VALUE_ACCURACY, path="best_model.pth")
+
+for epoch in range(CONFIG.N_EPOCHS):
+    train_loss, train_accuracy = train_model(model, train_loader, criterion, optimizer, CONFIG.DEVICE)
+    val_loss, val_accuracy, current_lr = evaluate_model(model, val_loader, criterion, CONFIG.DEVICE)
+
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    train_accuracies.append(train_accuracy)
+    val_accuracies.append(val_accuracy)
+    
+    print(f"Epoch {epoch+1}/{CONFIG.N_EPOCHS}")
+    print(f"Train Loss: {train_loss:.4f} | Train Accuracy: {train_accuracy:.2f}%")
+    print(f"Validation Loss: {val_loss:.4f} | Validation Accuracy: {val_accuracy:.2f}%")
+    print(f"Learning Rate: {current_lr}")
+
+    early_stopping(model, optimizer, scheduler, train_losses, val_losses, train_accuracies, val_accuracies, CONFIG.LR, CONFIG.L2, CONFIG.N_EPOCHS)
+    if early_stopping.early_stop:
+        print("Early stopping activated. Stopping training.")
+        break
